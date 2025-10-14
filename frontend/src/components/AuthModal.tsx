@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useAuth } from '../contexts/AuthContext';
 
 interface AuthModalProps {
@@ -14,8 +14,24 @@ const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose }) => {
   const [preferredLanguage, setPreferredLanguage] = useState('en');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [oauthProviders, setOauthProviders] = useState<any[]>([]);
 
-  const { login, register } = useAuth();
+  const { login, register, loginWithOAuth, getOAuthProviders } = useAuth();
+
+  useEffect(() => {
+    if (isOpen) {
+      loadOAuthProviders();
+    }
+  }, [isOpen]);
+
+  const loadOAuthProviders = async () => {
+    try {
+      const providers = await getOAuthProviders();
+      setOauthProviders(providers);
+    } catch (error) {
+      console.error('Failed to load OAuth providers:', error);
+    }
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -160,6 +176,34 @@ const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose }) => {
             {loading ? 'Please wait...' : (isLogin ? 'Login' : 'Create Account')}
           </button>
         </form>
+
+        {/* OAuth Providers */}
+        {oauthProviders.length > 0 && (
+          <div className="mt-6">
+            <div className="relative">
+              <div className="absolute inset-0 flex items-center">
+                <div className="w-full border-t border-gray-300" />
+              </div>
+              <div className="relative flex justify-center text-sm">
+                <span className="px-2 bg-white text-gray-500">Or continue with</span>
+              </div>
+            </div>
+
+            <div className="mt-6 grid grid-cols-1 gap-3">
+              {oauthProviders.map((provider) => (
+                <button
+                  key={provider.name}
+                  onClick={() => loginWithOAuth(provider.name, preferredLanguage)}
+                  className="w-full inline-flex justify-center py-2 px-4 border border-gray-300 rounded-md shadow-sm bg-white text-sm font-medium text-gray-500 hover:bg-gray-50 transition"
+                  style={{ borderColor: provider.color }}
+                >
+                  <span className="mr-2">{provider.icon}</span>
+                  {provider.display_name}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
 
         <div className="mt-6 text-center">
           <button

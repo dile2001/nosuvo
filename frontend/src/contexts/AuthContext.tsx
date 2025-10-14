@@ -7,11 +7,20 @@ interface User {
   preferred_language: string;
 }
 
+interface OAuthProvider {
+  name: string;
+  display_name: string;
+  icon: string;
+  color: string;
+}
+
 interface AuthContextType {
   user: User | null;
   sessionToken: string | null;
   login: (username: string, password: string) => Promise<boolean>;
   register: (username: string, email: string, password: string, preferredLanguage?: string) => Promise<boolean>;
+  loginWithOAuth: (provider: string, preferredLanguage?: string) => void;
+  getOAuthProviders: () => Promise<OAuthProvider[]>;
   logout: () => void;
   loading: boolean;
 }
@@ -44,6 +53,24 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
       verifySession(token);
     } else {
       setLoading(false);
+    }
+
+    // Handle OAuth callback
+    const urlParams = new URLSearchParams(window.location.search);
+    const oauthToken = urlParams.get('token');
+    const oauthSuccess = urlParams.get('success');
+    const oauthError = urlParams.get('error');
+
+    if (oauthToken && oauthSuccess === 'true') {
+      setSessionToken(oauthToken);
+      localStorage.setItem('sessionToken', oauthToken);
+      verifySession(oauthToken);
+      // Clean up URL
+      window.history.replaceState({}, document.title, window.location.pathname);
+    } else if (oauthError) {
+      console.error('OAuth error:', oauthError);
+      // Clean up URL
+      window.history.replaceState({}, document.title, window.location.pathname);
     }
   }, []);
 
@@ -131,6 +158,26 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
     }
   };
 
+  const loginWithOAuth = (provider: string, preferredLanguage: string = 'en') => {
+    // Redirect to OAuth provider
+    window.location.href = `/auth/oauth/${provider}?language=${preferredLanguage}`;
+  };
+
+  const getOAuthProviders = async (): Promise<OAuthProvider[]> => {
+    try {
+      const response = await fetch('/auth/oauth/providers');
+      const data = await response.json();
+      
+      if (data.success) {
+        return data.providers;
+      }
+      return [];
+    } catch (error) {
+      console.error('Failed to get OAuth providers:', error);
+      return [];
+    }
+  };
+
   const logout = () => {
     if (sessionToken) {
       // Call logout endpoint
@@ -152,6 +199,8 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
     sessionToken,
     login,
     register,
+    loginWithOAuth,
+    getOAuthProviders,
     logout,
     loading,
   };

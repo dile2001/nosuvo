@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, redirect, url_for, session
 from flask_cors import CORS
 import spacy
 import openai
@@ -11,6 +11,10 @@ from datetime import datetime
 import hashlib
 import secrets
 import uuid
+import jwt
+from authlib.integrations.flask_client import OAuth
+from authlib.common.security import generate_token
+import requests
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for frontend
@@ -18,8 +22,58 @@ CORS(app)  # Enable CORS for frontend
 # Load environment variables
 load_dotenv()
 
+# Set up session secret for OAuth
+app.secret_key = os.getenv('FLASK_SECRET_KEY', secrets.token_hex(32))
+
+# Initialize OAuth
+oauth = OAuth(app)
+
+# Configure OAuth providers
+def configure_oauth_providers():
+    """Configure OAuth providers for Google, Microsoft, and Apple"""
+    
+    # Google OAuth
+    google_client_id = os.getenv('GOOGLE_CLIENT_ID')
+    google_client_secret = os.getenv('GOOGLE_CLIENT_SECRET')
+    
+    if google_client_id and google_client_secret:
+        oauth.register(
+            name='google',
+            client_id=google_client_id,
+            client_secret=google_client_secret,
+            server_metadata_url='https://accounts.google.com/.well-known/openid_configuration',
+            client_kwargs={'scope': 'openid email profile'}
+        )
+    
+    # Microsoft OAuth
+    microsoft_client_id = os.getenv('MICROSOFT_CLIENT_ID')
+    microsoft_client_secret = os.getenv('MICROSOFT_CLIENT_SECRET')
+    
+    if microsoft_client_id and microsoft_client_secret:
+        oauth.register(
+            name='microsoft',
+            client_id=microsoft_client_id,
+            client_secret=microsoft_client_secret,
+            server_metadata_url='https://login.microsoftonline.com/common/v2.0/.well-known/openid_configuration',
+            client_kwargs={'scope': 'openid email profile'}
+        )
+    
+    # Apple OAuth (requires special handling due to JWT client secret)
+    apple_client_id = os.getenv('APPLE_CLIENT_ID')
+    
+    if apple_client_id:
+        oauth.register(
+            name='apple',
+            client_id=apple_client_id,
+            server_metadata_url='https://appleid.apple.com/.well-known/openid_configuration',
+            client_kwargs={'scope': 'openid email name'}
+        )
+
 # Load English model
 nlp = spacy.load("en_core_web_sm")
+
+# Configure OAuth providers
+configure_oauth_providers()
 
 # Simple session storage (in production, use Redis or database sessions)
 user_sessions = {}
@@ -49,6 +103,96 @@ def get_current_user():
     if token in user_sessions:
         return user_sessions[token]
     return None
+
+def create_apple_client_secret():
+    """Create Apple client secret JWT"""
+    team_id = os.getenv('APPLE_TEAM_ID')
+    key_id = os.getenv('APPLE_KEY_ID')
+    client_id = os.getenv('APPLE_CLIENT_ID')
+    private_key_path = os.getenv('APPLE_PRIVATE_KEY_PATH')
+    
+    if not all([team_id, key_id, client_id, private_key_path]):
+        return None
+    
+    try:
+        with open(private_key_path, 'r') as key_file:
+            private_key = key_file.read()
+        
+        headers = {
+            'kid': key_id,
+            'alg': 'ES256'
+        }
+        
+        payload = {
+            'iss': team_id,
+            'iat': datetime.utcnow().timestamp(),
+            'exp': datetime.utcnow().timestamp() + 86400 * 180,  # 6 months
+            'aud': 'https://appleid.apple.com',
+            'sub': client_id
+        }
+        
+        return jwt.encode(payload, private_key, algorithm='ES256', headers=headers)
+    except Exception as e:
+        print(f"Error creating Apple client secret: {e}")
+        return None
+
+def create_or_get_oauth_user(provider: str, user_info: dict, preferred_language: str = 'en'):
+    """Create or get user from OAuth provider info"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    
+    # Extract user information based on provider
+    if provider == 'google':
+        email = user_info.get('email', '')
+        username = user_info.get('name', email.split('@')[0])
+        display_name = user_info.get('name', '')
+    elif provider == 'microsoft':
+        email = user_info.get('email', '')
+        username = user_info.get('name', email.split('@')[0])
+        display_name = user_info.get('name', '')
+    elif provider == 'apple':
+        email = user_info.get('email', '')
+        username = email.split('@')[0] if email else f"apple_user_{secrets.token_hex(4)}"
+        display_name = user_info.get('name', {}).get('fullName', '') if user_info.get('name') else ''
+    else:
+        raise ValueError(f"Unsupported OAuth provider: {provider}")
+    
+    if not email:
+        raise ValueError("Email is required for OAuth authentication")
+    
+    # Check if user already exists
+    cursor.execute('SELECT id FROM users WHERE email = ?', (email,))
+    existing_user = cursor.fetchone()
+    
+    if existing_user:
+        user_id = existing_user[0]
+        # Update last login
+        cursor.execute('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?', (user_id,))
+    else:
+        # Create new user
+        cursor.execute('''
+            INSERT INTO users (username, email, password_hash, preferred_language, created_at, last_login)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        ''', (username, email, f"oauth_{provider}", preferred_language))
+        
+        user_id = cursor.lastrowid
+        
+        # Initialize user queue
+        initialize_user_queue(user_id, preferred_language)
+    
+    # Get user details
+    cursor.execute('SELECT username, email, preferred_language FROM users WHERE id = ?', (user_id,))
+    user_data = cursor.fetchone()
+    
+    conn.commit()
+    conn.close()
+    
+    return {
+        "user_id": user_id,
+        "username": user_data[0],
+        "email": user_data[1],
+        "preferred_language": user_data[2]
+    }
 
 def initialize_user_queue(user_id: int, preferred_language: str = 'en'):
     """Initialize user queue with all available exercises in their preferred language"""
@@ -1103,6 +1247,146 @@ def get_current_user_info():
             "error": str(e)
         }), 500
 
+# OAuth endpoints
+@app.route("/auth/oauth/<provider>", methods=["GET"])
+def oauth_login(provider):
+    """Initiate OAuth login with specified provider"""
+    try:
+        if provider not in ['google', 'microsoft', 'apple']:
+            return jsonify({
+                "success": False,
+                "error": "Unsupported OAuth provider"
+            }), 400
+        
+        # Store preferred language in session
+        preferred_language = request.args.get('language', 'en')
+        session['preferred_language'] = preferred_language
+        
+        # Generate redirect URI
+        redirect_uri = os.getenv('OAUTH_REDIRECT_URI', 'http://localhost:5001/auth/callback')
+        
+        if provider == 'apple':
+            # Apple requires special handling
+            client_secret = create_apple_client_secret()
+            if not client_secret:
+                return jsonify({
+                    "success": False,
+                    "error": "Apple OAuth not configured properly"
+                }), 500
+            
+            # Use Authlib's Apple client
+            client = oauth.apple
+            return client.authorize_redirect(redirect_uri, client_secret=client_secret)
+        else:
+            # Standard OAuth flow for Google and Microsoft
+            client = oauth.__getattr__(provider)
+            return client.authorize_redirect(redirect_uri)
+    
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+@app.route("/auth/callback", methods=["GET"])
+def oauth_callback():
+    """Handle OAuth callback from providers"""
+    try:
+        # Determine provider from request
+        provider = None
+        if 'google' in request.args.get('state', ''):
+            provider = 'google'
+        elif 'microsoft' in request.args.get('state', ''):
+            provider = 'microsoft'
+        elif 'apple' in request.args.get('state', ''):
+            provider = 'apple'
+        else:
+            # Try to determine from the authorization response
+            for p in ['google', 'microsoft', 'apple']:
+                if hasattr(oauth, p):
+                    try:
+                        client = oauth.__getattr__(p)
+                        token = client.authorize_access_token()
+                        if token:
+                            provider = p
+                            break
+                    except:
+                        continue
+        
+        if not provider:
+            return jsonify({
+                "success": False,
+                "error": "Could not determine OAuth provider"
+            }), 400
+        
+        # Get user info from provider
+        client = oauth.__getattr__(provider)
+        
+        if provider == 'apple':
+            # Apple requires special handling
+            client_secret = create_apple_client_secret()
+            token = client.authorize_access_token(client_secret=client_secret)
+        else:
+            token = client.authorize_access_token()
+        
+        user_info = token.get('userinfo')
+        if not user_info:
+            return jsonify({
+                "success": False,
+                "error": "Could not retrieve user information"
+            }), 400
+        
+        # Create or get user
+        preferred_language = session.get('preferred_language', 'en')
+        user_data = create_or_get_oauth_user(provider, user_info, preferred_language)
+        
+        # Generate session token
+        session_token = generate_session_token()
+        user_sessions[session_token] = user_data
+        
+        # Redirect to frontend with token
+        frontend_url = os.getenv('FRONTEND_URL', 'http://localhost:3000')
+        return redirect(f"{frontend_url}/auth/callback?token={session_token}&success=true")
+    
+    except Exception as e:
+        print(f"OAuth callback error: {e}")
+        frontend_url = os.getenv('FRONTEND_URL', 'http://localhost:3000')
+        return redirect(f"{frontend_url}/auth/callback?success=false&error={str(e)}")
+
+@app.route("/auth/oauth/providers", methods=["GET"])
+def get_oauth_providers():
+    """Get available OAuth providers"""
+    providers = []
+    
+    if os.getenv('GOOGLE_CLIENT_ID') and os.getenv('GOOGLE_CLIENT_SECRET'):
+        providers.append({
+            "name": "google",
+            "display_name": "Google",
+            "icon": "🔍",
+            "color": "#4285F4"
+        })
+    
+    if os.getenv('MICROSOFT_CLIENT_ID') and os.getenv('MICROSOFT_CLIENT_SECRET'):
+        providers.append({
+            "name": "microsoft",
+            "display_name": "Microsoft",
+            "icon": "🏢",
+            "color": "#00BCF2"
+        })
+    
+    if os.getenv('APPLE_CLIENT_ID'):
+        providers.append({
+            "name": "apple",
+            "display_name": "Apple",
+            "icon": "🍎",
+            "color": "#000000"
+        })
+    
+    return jsonify({
+        "success": True,
+        "providers": providers
+    })
+
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({
@@ -1113,6 +1397,9 @@ def home():
             "/auth/login": "POST - Login user",
             "/auth/logout": "POST - Logout user",
             "/auth/me": "GET - Get current user info",
+            "/auth/oauth/<provider>": "GET - OAuth login (google, microsoft, apple)",
+            "/auth/oauth/providers": "GET - Get available OAuth providers",
+            "/auth/callback": "GET - OAuth callback handler",
             "/chunk": "POST - Process text into reading chunks",
             "/questions": "POST - Generate comprehension questions from text",
             "/exercises": "GET - Get random exercise (supports ?language=, ?difficulty=, ?topic=)",
