@@ -28,4 +28,18 @@ APPLE_PRIVATE_KEY_PATH=path/to/apple/private/key.p8
 OAUTH_REDIRECT_URI=http://localhost:5001/auth/callback
 FRONTEND_URL=http://localhost:3000
 
+# Database Configuration
+# PostgreSQL Database URL
+DATABASE_URL=postgresql://username:password@localhost:5432/nosuvo_db
+
+# Alternative individual database settings
+DB_HOST=localhost
+DB_PORT=5432
+DB_NAME=nosuvo_db
+DB_USER=username
+DB_PASSWORD=password
+
+# Flask Secret Key (generate a random string)
+FLASK_SECRET_KEY=your_random_secret_key_here
+
 

@@ -5,7 +5,6 @@ import openai
 import os
 from dotenv import load_dotenv
 import json
-import sqlite3
 import random
 from datetime import datetime
 import hashlib
@@ -15,6 +14,7 @@ import jwt
 from authlib.integrations.flask_client import OAuth
 from authlib.common.security import generate_token
 import requests
+from database import get_db_connection, execute_query, execute_many, db_config, adapt_sql_for_dialect
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for frontend
@@ -138,9 +138,6 @@ def create_apple_client_secret():
 
 def create_or_get_oauth_user(provider: str, user_info: dict, preferred_language: str = 'en'):
     """Create or get user from OAuth provider info"""
-    conn = sqlite3.connect(DATABASE_PATH)
-    cursor = conn.cursor()
-    
     # Extract user information based on provider
     if provider == 'google':
         email = user_info.get('email', '')
@@ -161,90 +158,77 @@ def create_or_get_oauth_user(provider: str, user_info: dict, preferred_language:
         raise ValueError("Email is required for OAuth authentication")
     
     # Check if user already exists
-    cursor.execute('SELECT id FROM users WHERE email = ?', (email,))
-    existing_user = cursor.fetchone()
+    existing_user = execute_query('SELECT id FROM users WHERE email = ?', (email,), fetch=True)
     
     if existing_user:
-        user_id = existing_user[0]
+        user_id = existing_user[0]['id']
         # Update last login
-        cursor.execute('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?', (user_id,))
+        execute_query('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?', (user_id,))
     else:
         # Create new user
-        cursor.execute('''
+        execute_query('''
             INSERT INTO users (username, email, password_hash, preferred_language, created_at, last_login)
             VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
         ''', (username, email, f"oauth_{provider}", preferred_language))
         
-        user_id = cursor.lastrowid
+        # Get the new user ID
+        new_user = execute_query('SELECT id FROM users WHERE email = ?', (email,), fetch=True)
+        user_id = new_user[0]['id'] if new_user else None
         
-        # Initialize user queue
-        initialize_user_queue(user_id, preferred_language)
+        if user_id:
+            # Initialize user queue
+            initialize_user_queue(user_id, preferred_language)
     
     # Get user details
-    cursor.execute('SELECT username, email, preferred_language FROM users WHERE id = ?', (user_id,))
-    user_data = cursor.fetchone()
+    user_data = execute_query('SELECT username, email, preferred_language FROM users WHERE id = ?', (user_id,), fetch=True)
     
-    conn.commit()
-    conn.close()
+    if not user_data:
+        raise ValueError("Failed to retrieve user data")
     
     return {
         "user_id": user_id,
-        "username": user_data[0],
-        "email": user_data[1],
-        "preferred_language": user_data[2]
+        "username": user_data[0]['username'],
+        "email": user_data[0]['email'],
+        "preferred_language": user_data[0]['preferred_language']
     }
 
 def initialize_user_queue(user_id: int, preferred_language: str = 'en'):
     """Initialize user queue with all available exercises in their preferred language"""
-    conn = sqlite3.connect(DATABASE_PATH)
-    cursor = conn.cursor()
-    
     # Get all exercises in user's preferred language
-    cursor.execute('''
+    exercises = execute_query('''
         SELECT id FROM exercises 
         WHERE language = ? 
         AND id NOT IN (SELECT exercise_id FROM user_progress WHERE user_id = ? AND status = 'completed')
         ORDER BY difficulty, RANDOM()
-    ''', (preferred_language, user_id))
-    
-    exercises = cursor.fetchall()
+    ''', (preferred_language, user_id), fetch=True)
     
     # Add exercises to user queue
-    for position, (exercise_id,) in enumerate(exercises, 1):
-        cursor.execute('''
+    for position, exercise in enumerate(exercises, 1):
+        execute_query('''
             INSERT OR IGNORE INTO user_queue (user_id, exercise_id, queue_position)
             VALUES (?, ?, ?)
-        ''', (user_id, exercise_id, position))
-    
-    conn.commit()
-    conn.close()
+        ''', (user_id, exercise['id'], position))
 
 def get_next_exercise_for_user(user_id: int):
     """Get the next exercise in user's queue"""
-    conn = sqlite3.connect(DATABASE_PATH)
-    cursor = conn.cursor()
-    
     # Get the first exercise in queue
-    cursor.execute('''
+    exercise_result = execute_query('''
         SELECT e.id, e.title, e.text, e.language, e.difficulty, e.topic, e.questions
         FROM exercises e
         JOIN user_queue uq ON e.id = uq.exercise_id
         WHERE uq.user_id = ? AND uq.queue_position = 1
-    ''', (user_id,))
+    ''', (user_id,), fetch=True)
     
-    exercise = cursor.fetchone()
-    conn.close()
-    
-    if exercise:
-        exercise_id, title, text, lang, diff, topic, questions_json = exercise
+    if exercise_result:
+        exercise = exercise_result[0]
         return {
-            "id": exercise_id,
-            "title": title,
-            "text": text,
-            "language": lang,
-            "difficulty": diff,
-            "topic": topic,
-            "questions": json.loads(questions_json)
+            "id": exercise['id'],
+            "title": exercise['title'],
+            "text": exercise['text'],
+            "language": exercise['language'],
+            "difficulty": exercise['difficulty'],
+            "topic": exercise['topic'],
+            "questions": json.loads(exercise['questions'])
         }
     return None
 
@@ -252,14 +236,11 @@ def update_user_progress(user_id: int, exercise_id: int, comprehension_score: fl
                         questions_answered: int, questions_correct: int, 
                         reading_speed_wpm: float, session_duration_seconds: int):
     """Update user progress and manage queue based on comprehension score"""
-    conn = sqlite3.connect(DATABASE_PATH)
-    cursor = conn.cursor()
-    
     # Determine status based on comprehension score
     status = 'completed' if comprehension_score >= 0.7 else 'failed'
     
     # Update or insert progress
-    cursor.execute('''
+    execute_query('''
         INSERT OR REPLACE INTO user_progress 
         (user_id, exercise_id, status, comprehension_score, questions_answered, 
          questions_correct, reading_speed_wpm, session_duration_seconds, completed_at)
@@ -269,25 +250,22 @@ def update_user_progress(user_id: int, exercise_id: int, comprehension_score: fl
     
     # Remove from queue if completed successfully
     if status == 'completed':
-        cursor.execute('DELETE FROM user_queue WHERE user_id = ? AND exercise_id = ?', 
+        execute_query('DELETE FROM user_queue WHERE user_id = ? AND exercise_id = ?', 
                       (user_id, exercise_id))
         
         # Reorder remaining queue items
-        cursor.execute('''
+        execute_query('''
             UPDATE user_queue 
             SET queue_position = queue_position - 1 
             WHERE user_id = ? AND queue_position > 1
         ''', (user_id,))
     else:
         # Move failed exercise to bottom of queue
-        cursor.execute('''
+        execute_query('''
             UPDATE user_queue 
             SET queue_position = (SELECT MAX(queue_position) + 1 FROM user_queue WHERE user_id = ?)
             WHERE user_id = ? AND exercise_id = ?
         ''', (user_id, user_id, exercise_id))
-    
-    conn.commit()
-    conn.close()
     
     return status
 
@@ -299,16 +277,10 @@ else:
     openai_client = None
     print("⚠️  OpenAI API key not found. Question generation will use fallback questions.")
 
-# Database configuration
-DATABASE_PATH = 'exercises.db'
-
 def init_database():
-    """Initialize the SQLite database with exercises and user tables"""
-    conn = sqlite3.connect(DATABASE_PATH)
-    cursor = conn.cursor()
-    
+    """Initialize the database with exercises and user tables"""
     # Create exercises table
-    cursor.execute('''
+    exercises_sql = adapt_sql_for_dialect('''
         CREATE TABLE IF NOT EXISTS exercises (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT NOT NULL,
@@ -316,14 +288,15 @@ def init_database():
             language TEXT DEFAULT 'en',
             difficulty TEXT DEFAULT 'intermediate',
             topic TEXT DEFAULT 'general',
-            questions TEXT NOT NULL,  -- JSON string of questions
+            questions TEXT NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    execute_query(exercises_sql)
     
     # Create users table
-    cursor.execute('''
+    users_sql = adapt_sql_for_dialect('''
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
@@ -334,15 +307,16 @@ def init_database():
             last_login TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    execute_query(users_sql)
     
     # Create user_progress table to track reading sessions and comprehension
-    cursor.execute('''
+    progress_sql = adapt_sql_for_dialect('''
         CREATE TABLE IF NOT EXISTS user_progress (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
             exercise_id INTEGER NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending', -- pending, completed, failed
-            comprehension_score REAL DEFAULT 0.0, -- 0.0 to 1.0
+            status TEXT NOT NULL DEFAULT 'pending',
+            comprehension_score REAL DEFAULT 0.0,
             questions_answered INTEGER DEFAULT 0,
             questions_correct INTEGER DEFAULT 0,
             reading_speed_wpm REAL DEFAULT 0.0,
@@ -354,9 +328,10 @@ def init_database():
             UNIQUE(user_id, exercise_id)
         )
     ''')
+    execute_query(progress_sql)
     
     # Create user_queue table to manage text queue for each user
-    cursor.execute('''
+    queue_sql = adapt_sql_for_dialect('''
         CREATE TABLE IF NOT EXISTS user_queue (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
@@ -368,31 +343,31 @@ def init_database():
             UNIQUE(user_id, exercise_id)
         )
     ''')
+    execute_query(queue_sql)
     
     # Create indexes for better performance
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_language ON exercises(language)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_difficulty ON exercises(difficulty)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_topic ON exercises(topic)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_user_progress_user_id ON user_progress(user_id)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_user_progress_status ON user_progress(status)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_user_queue_user_id ON user_queue(user_id)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_user_queue_position ON user_queue(queue_position)')
+    index_sqls = [
+        'CREATE INDEX IF NOT EXISTS idx_language ON exercises(language)',
+        'CREATE INDEX IF NOT EXISTS idx_difficulty ON exercises(difficulty)',
+        'CREATE INDEX IF NOT EXISTS idx_topic ON exercises(topic)',
+        'CREATE INDEX IF NOT EXISTS idx_user_progress_user_id ON user_progress(user_id)',
+        'CREATE INDEX IF NOT EXISTS idx_user_progress_status ON user_progress(status)',
+        'CREATE INDEX IF NOT EXISTS idx_user_queue_user_id ON user_queue(user_id)',
+        'CREATE INDEX IF NOT EXISTS idx_user_queue_position ON user_queue(queue_position)'
+    ]
     
-    conn.commit()
-    conn.close()
+    for index_sql in index_sqls:
+        execute_query(index_sql)
 
 def insert_sample_exercises():
     """Insert sample exercises into the database"""
-    conn = sqlite3.connect(DATABASE_PATH)
-    cursor = conn.cursor()
-    
     # Check if exercises already exist
-    cursor.execute('SELECT COUNT(*) FROM exercises')
-    count = cursor.fetchone()[0]
+    count_result = execute_query('SELECT COUNT(*) as count FROM exercises', fetch=True)
+    count = count_result[0]['count'] if count_result else 0
     
     # Always add English exercises if they don't exist
-    cursor.execute('SELECT COUNT(*) FROM exercises WHERE language = ?', ('en',))
-    en_count = cursor.fetchone()[0]
+    en_result = execute_query('SELECT COUNT(*) as count FROM exercises WHERE language = ?', ('en',), fetch=True)
+    en_count = en_result[0]['count'] if en_result else 0
     
     if en_count == 0:
         english_exercises = [
@@ -434,89 +409,12 @@ def insert_sample_exercises():
                         "answer": "B"
                     }
                 ])
-            },
-            {
-                'title': 'Human Brain and Neural Plasticity',
-                'text': 'The human brain contains approximately 86 billion neurons, each capable of forming thousands of connections with other neurons. This creates a complex network that processes information at incredible speeds. Neural plasticity, the brain\'s ability to reorganize itself, allows us to learn new skills throughout our lives. Recent research shows that reading regularly can increase neural connectivity and even help prevent cognitive decline as we age.',
-                'language': 'en',
-                'difficulty': 'intermediate',
-                'topic': 'science',
-                'questions': json.dumps([
-                    {
-                        "question": "How many neurons does the human brain contain?",
-                        "options": {
-                            "A": "86 million",
-                            "B": "86 billion",
-                            "C": "860 billion",
-                            "D": "8.6 billion"
-                        },
-                        "answer": "B"
-                    },
-                    {
-                        "question": "What is neural plasticity?",
-                        "options": {
-                            "A": "The brain's ability to reorganize itself",
-                            "B": "The speed of neural connections",
-                            "C": "The number of neurons in the brain",
-                            "D": "The brain's processing power"
-                        },
-                        "answer": "A"
-                    },
-                    {
-                        "question": "What benefit does regular reading provide according to recent research?",
-                        "options": {
-                            "A": "It increases brain size",
-                            "B": "It increases neural connectivity and helps prevent cognitive decline",
-                            "C": "It reduces the need for sleep",
-                            "D": "It improves physical strength"
-                        },
-                        "answer": "B"
-                    }
-                ])
-            },
-            {
-                'title': 'Climate Change and Global Impact',
-                'text': 'Climate change is one of the most pressing challenges of our time, affecting ecosystems, weather patterns, and human societies worldwide. Rising global temperatures lead to melting ice caps, rising sea levels, and more frequent extreme weather events. Scientists agree that human activities, particularly the burning of fossil fuels, are the primary driver of current climate change. Transitioning to renewable energy sources and implementing sustainable practices are crucial steps in addressing this global crisis.',
-                'language': 'en',
-                'difficulty': 'advanced',
-                'topic': 'environment',
-                'questions': json.dumps([
-                    {
-                        "question": "What is identified as the primary driver of current climate change?",
-                        "options": {
-                            "A": "Natural weather cycles",
-                            "B": "Solar radiation changes",
-                            "C": "Human activities, particularly burning fossil fuels",
-                            "D": "Volcanic activity"
-                        },
-                        "answer": "C"
-                    },
-                    {
-                        "question": "Which of the following is NOT mentioned as a consequence of rising global temperatures?",
-                        "options": {
-                            "A": "Melting ice caps",
-                            "B": "Rising sea levels",
-                            "C": "More frequent extreme weather events",
-                            "D": "Increased rainfall everywhere"
-                        },
-                        "answer": "D"
-                    },
-                    {
-                        "question": "What are mentioned as crucial steps in addressing climate change?",
-                        "options": {
-                            "A": "Building more factories",
-                            "B": "Transitioning to renewable energy and implementing sustainable practices",
-                            "C": "Increasing fossil fuel use",
-                            "D": "Ignoring the problem"
-                        },
-                        "answer": "B"
-                    }
-                ])
             }
         ]
         
+        # Insert English exercises
         for exercise in english_exercises:
-            cursor.execute('''
+            execute_query('''
                 INSERT INTO exercises (title, text, language, difficulty, topic, questions)
                 VALUES (?, ?, ?, ?, ?, ?)
             ''', (
@@ -527,46 +425,13 @@ def insert_sample_exercises():
                 exercise['topic'],
                 exercise['questions']
             ))
+        
+        print(f"✅ Added {len(english_exercises)} English exercises")
     
+    # Only add other languages if no exercises exist at all
     if count == 0:
-        sample_exercises = [
-            {
-                'title': 'Artificial Intelligence in Healthcare',
-                'text': 'Artificial intelligence is revolutionizing healthcare by providing faster and more accurate diagnoses. Machine learning algorithms can analyze medical images, predict patient outcomes, and assist doctors in treatment decisions. This technology has the potential to improve patient care while reducing costs and medical errors.',
-                'language': 'es',
-                'difficulty': 'intermediate',
-                'topic': 'technology',
-                'questions': json.dumps([
-                    {
-                        "question": "¿Cómo está revolucionando la inteligencia artificial la atención médica?",
-                        "options": {
-                            "A": "Reduciendo el personal médico",
-                            "B": "Proporcionando diagnósticos más rápidos y precisos",
-                            "C": "Eliminando la necesidad de doctores",
-                            "D": "Aumentando los costos médicos"
-                        },
-                        "answer": "B"
-                    }
-                ])
-            }
-        ]
-        
-        for exercise in sample_exercises:
-            cursor.execute('''
-                INSERT INTO exercises (title, text, language, difficulty, topic, questions)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (
-                exercise['title'],
-                exercise['text'],
-                exercise['language'],
-                exercise['difficulty'],
-                exercise['topic'],
-                exercise['questions']
-            ))
-        
-        conn.commit()
-    
-    conn.close()
+        # Add exercises for other languages here if needed
+        print("📚 Database initialized with sample exercises")
 
 # Initialize database on startup
 init_database()
@@ -739,9 +604,6 @@ def get_exercises():
         difficulty = request.args.get('difficulty')
         topic = request.args.get('topic')
         
-        conn = sqlite3.connect(DATABASE_PATH)
-        cursor = conn.cursor()
-        
         # Build query with optional filters
         query = "SELECT id, title, text, language, difficulty, topic, questions FROM exercises WHERE language = ?"
         params = [language]
@@ -754,29 +616,26 @@ def get_exercises():
             query += " AND topic = ?"
             params.append(topic)
         
-        cursor.execute(query, params)
-        exercises = cursor.fetchall()
+        exercises = execute_query(query, tuple(params), fetch=True)
         
         if not exercises:
             # Fallback to any language if no exercises found
-            cursor.execute("SELECT id, title, text, language, difficulty, topic, questions FROM exercises")
-            exercises = cursor.fetchall()
+            exercises = execute_query("SELECT id, title, text, language, difficulty, topic, questions FROM exercises", fetch=True)
         
         if exercises:
             # Select random exercise
             selected_exercise = random.choice(exercises)
-            exercise_id, title, text, lang, diff, top, questions_json = selected_exercise
             
             return jsonify({
                 "success": True,
                 "exercise": {
-                    "id": exercise_id,
-                    "title": title,
-                    "text": text,
-                    "language": lang,
-                    "difficulty": diff,
-                    "topic": top,
-                    "questions": json.loads(questions_json)
+                    "id": selected_exercise['id'],
+                    "title": selected_exercise['title'],
+                    "text": selected_exercise['text'],
+                    "language": selected_exercise['language'],
+                    "difficulty": selected_exercise['difficulty'],
+                    "topic": selected_exercise['topic'],
+                    "questions": json.loads(selected_exercise['questions'])
                 }
             })
         else:
@@ -784,8 +643,6 @@ def get_exercises():
                 "success": False,
                 "error": "No exercises found"
             }), 404
-        
-        conn.close()
     
     except Exception as e:
         return jsonify({
@@ -901,11 +758,8 @@ def get_user_progress():
                 "error": "Authentication required"
             }), 401
         
-        conn = sqlite3.connect(DATABASE_PATH)
-        cursor = conn.cursor()
-        
         # Get user's progress statistics
-        cursor.execute('''
+        stats_result = execute_query('''
             SELECT 
                 COUNT(*) as total_exercises,
                 SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_exercises,
@@ -915,20 +769,23 @@ def get_user_progress():
                 SUM(session_duration_seconds) as total_reading_time
             FROM user_progress 
             WHERE user_id = ?
-        ''', (user["user_id"],))
+        ''', (user["user_id"],), fetch=True)
         
-        stats = cursor.fetchone()
+        stats = stats_result[0] if stats_result else {}
         
         # Get queue information
-        cursor.execute('''
-            SELECT COUNT(*) FROM user_queue WHERE user_id = ?
-        ''', (user["user_id"],))
+        queue_result = execute_query('''
+            SELECT COUNT(*) as count FROM user_queue WHERE user_id = ?
+        ''', (user["user_id"],), fetch=True)
         
-        queue_count = cursor.fetchone()[0]
+        queue_count = queue_result[0]['count'] if queue_result else 0
         
-        conn.close()
-        
-        total_exercises, completed_exercises, failed_exercises, avg_comprehension, avg_reading_speed, total_reading_time = stats
+        total_exercises = stats.get('total_exercises', 0)
+        completed_exercises = stats.get('completed_exercises', 0)
+        failed_exercises = stats.get('failed_exercises', 0)
+        avg_comprehension = stats.get('avg_comprehension', 0.0)
+        avg_reading_speed = stats.get('avg_reading_speed', 0.0)
+        total_reading_time = stats.get('total_reading_time', 0)
         
         return jsonify({
             "success": True,
@@ -955,26 +812,21 @@ def get_user_progress():
 def get_exercise_stats():
     """Get statistics about available exercises"""
     try:
-        conn = sqlite3.connect(DATABASE_PATH)
-        cursor = conn.cursor()
-        
         # Get total count
-        cursor.execute("SELECT COUNT(*) FROM exercises")
-        total_count = cursor.fetchone()[0]
+        total_result = execute_query("SELECT COUNT(*) as count FROM exercises", fetch=True)
+        total_count = total_result[0]['count'] if total_result else 0
         
         # Get count by language
-        cursor.execute("SELECT language, COUNT(*) FROM exercises GROUP BY language")
-        by_language = dict(cursor.fetchall())
+        language_result = execute_query("SELECT language, COUNT(*) as count FROM exercises GROUP BY language", fetch=True)
+        by_language = {row['language']: row['count'] for row in language_result} if language_result else {}
         
         # Get count by difficulty
-        cursor.execute("SELECT difficulty, COUNT(*) FROM exercises GROUP BY difficulty")
-        by_difficulty = dict(cursor.fetchall())
+        difficulty_result = execute_query("SELECT difficulty, COUNT(*) as count FROM exercises GROUP BY difficulty", fetch=True)
+        by_difficulty = {row['difficulty']: row['count'] for row in difficulty_result} if difficulty_result else {}
         
         # Get count by topic
-        cursor.execute("SELECT topic, COUNT(*) FROM exercises GROUP BY topic")
-        by_topic = dict(cursor.fetchall())
-        
-        conn.close()
+        topic_result = execute_query("SELECT topic, COUNT(*) as count FROM exercises GROUP BY topic", fetch=True)
+        by_topic = {row['topic']: row['count'] for row in topic_result} if topic_result else {}
         
         return jsonify({
             "success": True,
@@ -1007,10 +859,7 @@ def add_exercise():
                     "error": f"Missing required field: {field}"
                 }), 400
         
-        conn = sqlite3.connect(DATABASE_PATH)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
+        execute_query('''
             INSERT INTO exercises (title, text, language, difficulty, topic, questions)
             VALUES (?, ?, ?, ?, ?, ?)
         ''', (
@@ -1022,9 +871,10 @@ def add_exercise():
             json.dumps(data['questions'])
         ))
         
-        exercise_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
+        # Get the new exercise ID
+        new_exercise = execute_query('SELECT id FROM exercises WHERE title = ? AND text = ?', 
+                                   (data['title'], data['text']), fetch=True)
+        exercise_id = new_exercise[0]['id'] if new_exercise else None
         
         return jsonify({
             "success": True,
@@ -1077,13 +927,9 @@ def register():
                 "error": "Invalid email address"
             }), 400
         
-        conn = sqlite3.connect(DATABASE_PATH)
-        cursor = conn.cursor()
-        
         # Check if user already exists
-        cursor.execute('SELECT id FROM users WHERE username = ? OR email = ?', (username, email))
-        if cursor.fetchone():
-            conn.close()
+        existing_user = execute_query('SELECT id FROM users WHERE username = ? OR email = ?', (username, email), fetch=True)
+        if existing_user:
             return jsonify({
                 "success": False,
                 "error": "Username or email already exists"
@@ -1091,17 +937,18 @@ def register():
         
         # Create user
         password_hash = hash_password(password)
-        cursor.execute('''
+        execute_query('''
             INSERT INTO users (username, email, password_hash, preferred_language)
             VALUES (?, ?, ?, ?)
         ''', (username, email, password_hash, preferred_language))
         
-        user_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
+        # Get the new user ID
+        new_user = execute_query('SELECT id FROM users WHERE email = ?', (email,), fetch=True)
+        user_id = new_user[0]['id'] if new_user else None
         
-        # Initialize user queue
-        initialize_user_queue(user_id, preferred_language)
+        if user_id:
+            # Initialize user queue
+            initialize_user_queue(user_id, preferred_language)
         
         # Generate session token
         session_token = generate_session_token()
@@ -1146,26 +993,25 @@ def login():
         username = data['username'].strip()
         password = data['password']
         
-        conn = sqlite3.connect(DATABASE_PATH)
-        cursor = conn.cursor()
-        
         # Find user by username or email
-        cursor.execute('''
+        user_result = execute_query('''
             SELECT id, username, email, password_hash, preferred_language 
             FROM users 
             WHERE username = ? OR email = ?
-        ''', (username, username.lower()))
+        ''', (username, username.lower()), fetch=True)
         
-        user = cursor.fetchone()
-        conn.close()
-        
-        if not user:
+        if not user_result:
             return jsonify({
                 "success": False,
                 "error": "Invalid username or password"
             }), 401
         
-        user_id, db_username, email, password_hash, preferred_language = user
+        user = user_result[0]
+        user_id = user['id']
+        db_username = user['username']
+        email = user['email']
+        password_hash = user['password_hash']
+        preferred_language = user['preferred_language']
         
         if not verify_password(password, password_hash):
             return jsonify({
@@ -1182,11 +1028,7 @@ def login():
         }
         
         # Update last login
-        conn = sqlite3.connect(DATABASE_PATH)
-        cursor = conn.cursor()
-        cursor.execute('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?', (user_id,))
-        conn.commit()
-        conn.close()
+        execute_query('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?', (user_id,))
         
         return jsonify({
             "success": True,
