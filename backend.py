@@ -16,9 +16,14 @@ from authlib.common.security import generate_token
 import requests
 from pathlib import Path
 from database import get_db_connection, execute_query, execute_many, db_config, init_database_schema
+from logging_config import setup_logging, get_logger, log_exception
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for frontend
+
+# Setup logging
+setup_logging('nosuvo_backend', log_level='DEBUG')
+logger = get_logger(__name__)
 
 # Load environment variables
 # Load .env.local first (takes precedence), then .env
@@ -590,6 +595,7 @@ def get_exercises():
             }), 404
     
     except Exception as e:
+        log_exception(logger, f"Error in get_exercises endpoint: {str(e)}")
         return jsonify({
             "success": False,
             "error": str(e)
