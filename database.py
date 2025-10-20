@@ -1,28 +1,38 @@
 """
 Database configuration and connection management for NoSubvo
-Supports both SQLite (development) and PostgreSQL (production)
+PostgreSQL only - Production-ready configuration
 """
 
 import os
 import psycopg2
-import sqlite3
+from psycopg2.extras import RealDictCursor
 from contextlib import contextmanager
 from dotenv import load_dotenv
 from typing import Optional, Dict, Any, List, Tuple
 import logging
-
-# Load environment variables
-load_dotenv()
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# Load environment variables
+# Load .env.local first (takes precedence), then .env
+env_local_path = Path('.env.local')
+env_path = Path('.env')
+
+if env_local_path.exists():
+    load_dotenv(dotenv_path=env_local_path, override=True)
+    logger.info("Loaded configuration from .env.local")
+elif env_path.exists():
+    load_dotenv(dotenv_path=env_path)
+    logger.info("Loaded configuration from .env")
+else:
+    load_dotenv()  # Try default locations
+    logger.warning("No .env or .env.local file found, using system environment variables")
+
 class DatabaseConfig:
-    """Database configuration manager"""
+    """PostgreSQL database configuration manager"""
     
     def __init__(self):
-        self.db_type = os.getenv('DB_TYPE', 'sqlite')  # 'sqlite' or 'postgresql'
-        self.database_url = os.getenv('DATABASE_URL')
-        
         # PostgreSQL settings
         self.db_host = os.getenv('DB_HOST', 'localhost')
         self.db_port = int(os.getenv('DB_PORT', 5432))
@@ -30,26 +40,22 @@ class DatabaseConfig:
         self.db_user = os.getenv('DB_USER', 'postgres')
         self.db_password = os.getenv('DB_PASSWORD', '')
         
-        # SQLite settings
-        self.sqlite_path = os.getenv('SQLITE_PATH', 'exercises.db')
+        # Connection string (optional, for compatibility)
+        self.database_url = os.getenv('DATABASE_URL')
         
-    def get_connection_string(self) -> str:
-        """Get the appropriate connection string based on configuration"""
-        if self.db_type == 'postgresql':
-            if self.database_url:
-                return self.database_url
-            else:
-                return f"postgresql://{self.db_user}:{self.db_password}@{self.db_host}:{self.db_port}/{self.db_name}"
+    def get_connection_params(self) -> Dict[str, Any]:
+        """Get PostgreSQL connection parameters"""
+        if self.database_url:
+            # Parse DATABASE_URL if provided
+            return {'dsn': self.database_url}
         else:
-            return self.sqlite_path
-    
-    def is_postgresql(self) -> bool:
-        """Check if using PostgreSQL"""
-        return self.db_type == 'postgresql'
-    
-    def is_sqlite(self) -> bool:
-        """Check if using SQLite"""
-        return self.db_type == 'sqlite'
+            return {
+                'host': self.db_host,
+                'port': self.db_port,
+                'database': self.db_name,
+                'user': self.db_user,
+                'password': self.db_password
+            }
 
 # Global database configuration
 db_config = DatabaseConfig()
@@ -57,23 +63,16 @@ db_config = DatabaseConfig()
 @contextmanager
 def get_db_connection():
     """
-    Context manager for database connections
-    Automatically handles both SQLite and PostgreSQL
+    Context manager for PostgreSQL database connections
+    Automatically handles connection and cleanup
     """
     connection = None
     try:
-        if db_config.is_postgresql():
-            connection = psycopg2.connect(
-                host=db_config.db_host,
-                port=db_config.db_port,
-                database=db_config.db_name,
-                user=db_config.db_user,
-                password=db_config.db_password
-            )
-            connection.autocommit = False
-        else:
-            connection = sqlite3.connect(db_config.sqlite_path)
-            connection.row_factory = sqlite3.Row
+        connection = psycopg2.connect(
+            **db_config.get_connection_params(),
+            cursor_factory=RealDictCursor
+        )
+        connection.autocommit = False
         
         yield connection
         
@@ -90,7 +89,7 @@ def get_db_connection():
 def get_db_cursor():
     """
     Context manager for database cursors
-    Automatically handles both SQLite and PostgreSQL
+    Automatically handles connection and cursor lifecycle
     """
     with get_db_connection() as conn:
         cursor = conn.cursor()
@@ -105,11 +104,11 @@ def get_db_cursor():
 
 def execute_query(query: str, params: Optional[Tuple] = None, fetch: bool = False) -> Optional[List[Dict[str, Any]]]:
     """
-    Execute a database query with automatic connection management
+    Execute a PostgreSQL query with automatic connection management
     
     Args:
-        query: SQL query string
-        params: Query parameters
+        query: SQL query string (using %s for parameters)
+        params: Query parameters tuple
         fetch: Whether to fetch results
     
     Returns:
@@ -123,20 +122,17 @@ def execute_query(query: str, params: Optional[Tuple] = None, fetch: bool = Fals
                 cursor.execute(query)
             
             if fetch:
-                if db_config.is_postgresql():
-                    # PostgreSQL returns tuples
-                    columns = [desc[0] for desc in cursor.description]
-                    results = cursor.fetchall()
-                    return [dict(zip(columns, row)) for row in results]
-                else:
-                    # SQLite returns Row objects
-                    return [dict(row) for row in cursor.fetchall()]
+                results = cursor.fetchall()
+                # RealDictCursor returns dict-like objects
+                return [dict(row) for row in results]
             else:
                 conn.commit()
                 return None
                 
         except Exception as e:
             logger.error(f"Query execution error: {e}")
+            logger.error(f"Query: {query}")
+            logger.error(f"Params: {params}")
             conn.rollback()
             raise
 
@@ -159,27 +155,21 @@ def execute_many(query: str, params_list: List[Tuple]) -> None:
 
 def test_connection() -> bool:
     """
-    Test database connection
+    Test PostgreSQL connection
     
     Returns:
         True if connection successful, False otherwise
     """
     try:
         with get_db_connection() as conn:
-            if db_config.is_postgresql():
-                cursor = conn.cursor()
-                cursor.execute("SELECT 1")
-                cursor.fetchone()
-                cursor.close()
-            else:
-                cursor = conn.cursor()
-                cursor.execute("SELECT 1")
-                cursor.fetchone()
-                cursor.close()
-        logger.info("Database connection test successful")
+            cursor = conn.cursor()
+            cursor.execute("SELECT version()")
+            version = cursor.fetchone()
+            cursor.close()
+            logger.info(f"PostgreSQL connection successful: {version['version']}")
         return True
     except Exception as e:
-        logger.error(f"Database connection test failed: {e}")
+        logger.error(f"PostgreSQL connection test failed: {e}")
         return False
 
 def get_database_info() -> Dict[str, Any]:
@@ -190,53 +180,136 @@ def get_database_info() -> Dict[str, Any]:
         Dictionary with database information
     """
     return {
-        'type': db_config.db_type,
-        'connection_string': db_config.get_connection_string() if not db_config.is_postgresql() else '***hidden***',
-        'is_postgresql': db_config.is_postgresql(),
-        'is_sqlite': db_config.is_sqlite(),
-        'host': db_config.db_host if db_config.is_postgresql() else None,
-        'port': db_config.db_port if db_config.is_postgresql() else None,
-        'database': db_config.db_name if db_config.is_postgresql() else db_config.sqlite_path,
-        'user': db_config.db_user if db_config.is_postgresql() else None
+        'type': 'postgresql',
+        'host': db_config.db_host,
+        'port': db_config.db_port,
+        'database': db_config.db_name,
+        'user': db_config.db_user,
+        'connection_params': db_config.get_connection_params()
     }
 
-# SQL compatibility helpers
-def get_sql_dialect() -> str:
-    """Get the SQL dialect for the current database"""
-    return 'postgresql' if db_config.is_postgresql() else 'sqlite'
-
-def adapt_sql_for_dialect(sql: str) -> str:
+def init_database_schema():
     """
-    Adapt SQL queries for different database dialects
-    
-    Args:
-        sql: SQL query string
-    
-    Returns:
-        Adapted SQL query
+    Initialize the PostgreSQL database schema
+    Creates all necessary tables and indexes
     """
-    if db_config.is_postgresql():
-        # PostgreSQL specific adaptations
-        sql = sql.replace('AUTOINCREMENT', 'SERIAL')
-        sql = sql.replace('INTEGER PRIMARY KEY AUTOINCREMENT', 'SERIAL PRIMARY KEY')
-        sql = sql.replace('TIMESTAMP DEFAULT CURRENT_TIMESTAMP', 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP')
-    else:
-        # SQLite specific adaptations
-        sql = sql.replace('SERIAL', 'INTEGER')
-        sql = sql.replace('SERIAL PRIMARY KEY', 'INTEGER PRIMARY KEY AUTOINCREMENT')
-    
-    return sql
+    with get_db_cursor() as (cursor, conn):
+        try:
+            # Create exercises table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS exercises (
+                    id SERIAL PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    language TEXT DEFAULT 'en',
+                    difficulty TEXT DEFAULT 'intermediate',
+                    topic TEXT DEFAULT 'general',
+                    questions TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            # Create users table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id SERIAL PRIMARY KEY,
+                    username TEXT UNIQUE NOT NULL,
+                    email TEXT UNIQUE NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    preferred_language TEXT DEFAULT 'en',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_login TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            # Create user_progress table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS user_progress (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    exercise_id INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    comprehension_score REAL DEFAULT 0.0,
+                    questions_answered INTEGER DEFAULT 0,
+                    questions_correct INTEGER DEFAULT 0,
+                    reading_speed_wpm REAL DEFAULT 0.0,
+                    session_duration_seconds INTEGER DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    completed_at TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
+                    FOREIGN KEY (exercise_id) REFERENCES exercises (id) ON DELETE CASCADE,
+                    UNIQUE(user_id, exercise_id)
+                )
+            """)
+            
+            # Create user_queue table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS user_queue (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    exercise_id INTEGER NOT NULL,
+                    queue_position INTEGER NOT NULL,
+                    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
+                    FOREIGN KEY (exercise_id) REFERENCES exercises (id) ON DELETE CASCADE,
+                    UNIQUE(user_id, exercise_id)
+                )
+            """)
+            
+            # Create indexes for better performance
+            indexes = [
+                "CREATE INDEX IF NOT EXISTS idx_exercises_language ON exercises(language)",
+                "CREATE INDEX IF NOT EXISTS idx_exercises_difficulty ON exercises(difficulty)",
+                "CREATE INDEX IF NOT EXISTS idx_exercises_topic ON exercises(topic)",
+                "CREATE INDEX IF NOT EXISTS idx_user_progress_user_id ON user_progress(user_id)",
+                "CREATE INDEX IF NOT EXISTS idx_user_progress_exercise_id ON user_progress(exercise_id)",
+                "CREATE INDEX IF NOT EXISTS idx_user_progress_status ON user_progress(status)",
+                "CREATE INDEX IF NOT EXISTS idx_user_queue_user_id ON user_queue(user_id)",
+                "CREATE INDEX IF NOT EXISTS idx_user_queue_position ON user_queue(queue_position)"
+            ]
+            
+            for index_sql in indexes:
+                cursor.execute(index_sql)
+            
+            conn.commit()
+            logger.info("Database schema initialized successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize database schema: {e}")
+            conn.rollback()
+            raise
 
 if __name__ == "__main__":
     # Test the database configuration
-    print("Database Configuration:")
-    print(f"Type: {db_config.db_type}")
-    print(f"Connection String: {db_config.get_connection_string()}")
-    print(f"Is PostgreSQL: {db_config.is_postgresql()}")
-    print(f"Is SQLite: {db_config.is_sqlite()}")
+    logging.basicConfig(level=logging.INFO)
+    
+    print("PostgreSQL Database Configuration:")
+    print("=" * 50)
+    info = get_database_info()
+    print(f"Host: {info['host']}")
+    print(f"Port: {info['port']}")
+    print(f"Database: {info['database']}")
+    print(f"User: {info['user']}")
+    print()
     
     # Test connection
     if test_connection():
-        print("✅ Database connection successful")
+        print("✅ PostgreSQL connection successful")
+        
+        # Try to get version
+        try:
+            with get_db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT version()")
+                version = cursor.fetchone()
+                print(f"PostgreSQL Version: {version['version'].split(',')[0]}")
+                cursor.close()
+        except Exception as e:
+            print(f"⚠️  Could not get version: {e}")
     else:
-        print("❌ Database connection failed")
+        print("❌ PostgreSQL connection failed")
+        print("\nPlease ensure:")
+        print("1. PostgreSQL is installed and running")
+        print("2. Database 'nosuvo_db' exists (or create it with: createdb nosuvo_db)")
+        print("3. .env.local has correct DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD")

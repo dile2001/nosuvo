@@ -14,13 +14,26 @@ import jwt
 from authlib.integrations.flask_client import OAuth
 from authlib.common.security import generate_token
 import requests
-from database import get_db_connection, execute_query, execute_many, db_config, adapt_sql_for_dialect
+from pathlib import Path
+from database import get_db_connection, execute_query, execute_many, db_config, init_database_schema
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for frontend
 
 # Load environment variables
-load_dotenv()
+# Load .env.local first (takes precedence), then .env
+env_local_path = Path('.env.local')
+env_path = Path('.env')
+
+if env_local_path.exists():
+    load_dotenv(dotenv_path=env_local_path, override=True)
+    print("✅ Loaded configuration from .env.local")
+elif env_path.exists():
+    load_dotenv(dotenv_path=env_path)
+    print("✅ Loaded configuration from .env")
+else:
+    load_dotenv()  # Try default locations
+    print("⚠️  No .env or .env.local file found, using system environment variables")
 
 # Set up session secret for OAuth
 app.secret_key = os.getenv('FLASK_SECRET_KEY', secrets.token_hex(32))
@@ -158,21 +171,21 @@ def create_or_get_oauth_user(provider: str, user_info: dict, preferred_language:
         raise ValueError("Email is required for OAuth authentication")
     
     # Check if user already exists
-    existing_user = execute_query('SELECT id FROM users WHERE email = ?', (email,), fetch=True)
+    existing_user = execute_query('SELECT id FROM users WHERE email = %s', (email,), fetch=True)
     
     if existing_user:
         user_id = existing_user[0]['id']
         # Update last login
-        execute_query('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?', (user_id,))
+        execute_query('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = %s', (user_id,))
     else:
         # Create new user
         execute_query('''
             INSERT INTO users (username, email, password_hash, preferred_language, created_at, last_login)
-            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
         ''', (username, email, f"oauth_{provider}", preferred_language))
         
         # Get the new user ID
-        new_user = execute_query('SELECT id FROM users WHERE email = ?', (email,), fetch=True)
+        new_user = execute_query('SELECT id FROM users WHERE email = %s', (email,), fetch=True)
         user_id = new_user[0]['id'] if new_user else None
         
         if user_id:
@@ -180,7 +193,7 @@ def create_or_get_oauth_user(provider: str, user_info: dict, preferred_language:
             initialize_user_queue(user_id, preferred_language)
     
     # Get user details
-    user_data = execute_query('SELECT username, email, preferred_language FROM users WHERE id = ?', (user_id,), fetch=True)
+    user_data = execute_query('SELECT username, email, preferred_language FROM users WHERE id = %s', (user_id,), fetch=True)
     
     if not user_data:
         raise ValueError("Failed to retrieve user data")
@@ -197,16 +210,17 @@ def initialize_user_queue(user_id: int, preferred_language: str = 'en'):
     # Get all exercises in user's preferred language
     exercises = execute_query('''
         SELECT id FROM exercises 
-        WHERE language = ? 
-        AND id NOT IN (SELECT exercise_id FROM user_progress WHERE user_id = ? AND status = 'completed')
+        WHERE language = %s 
+        AND id NOT IN (SELECT exercise_id FROM user_progress WHERE user_id = %s AND status = 'completed')
         ORDER BY difficulty, RANDOM()
     ''', (preferred_language, user_id), fetch=True)
     
     # Add exercises to user queue
     for position, exercise in enumerate(exercises, 1):
         execute_query('''
-            INSERT OR IGNORE INTO user_queue (user_id, exercise_id, queue_position)
-            VALUES (?, ?, ?)
+            INSERT INTO user_queue (user_id, exercise_id, queue_position)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (user_id, exercise_id) DO NOTHING
         ''', (user_id, exercise['id'], position))
 
 def get_next_exercise_for_user(user_id: int):
@@ -216,7 +230,7 @@ def get_next_exercise_for_user(user_id: int):
         SELECT e.id, e.title, e.text, e.language, e.difficulty, e.topic, e.questions
         FROM exercises e
         JOIN user_queue uq ON e.id = uq.exercise_id
-        WHERE uq.user_id = ? AND uq.queue_position = 1
+        WHERE uq.user_id = %s AND uq.queue_position = 1
     ''', (user_id,), fetch=True)
     
     if exercise_result:
@@ -241,30 +255,39 @@ def update_user_progress(user_id: int, exercise_id: int, comprehension_score: fl
     
     # Update or insert progress
     execute_query('''
-        INSERT OR REPLACE INTO user_progress 
+        INSERT INTO user_progress 
         (user_id, exercise_id, status, comprehension_score, questions_answered, 
          questions_correct, reading_speed_wpm, session_duration_seconds, completed_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+        ON CONFLICT (user_id, exercise_id) 
+        DO UPDATE SET 
+            status = EXCLUDED.status,
+            comprehension_score = EXCLUDED.comprehension_score,
+            questions_answered = EXCLUDED.questions_answered,
+            questions_correct = EXCLUDED.questions_correct,
+            reading_speed_wpm = EXCLUDED.reading_speed_wpm,
+            session_duration_seconds = EXCLUDED.session_duration_seconds,
+            completed_at = EXCLUDED.completed_at
     ''', (user_id, exercise_id, status, comprehension_score, questions_answered, 
           questions_correct, reading_speed_wpm, session_duration_seconds))
     
     # Remove from queue if completed successfully
     if status == 'completed':
-        execute_query('DELETE FROM user_queue WHERE user_id = ? AND exercise_id = ?', 
+        execute_query('DELETE FROM user_queue WHERE user_id = %s AND exercise_id = %s', 
                       (user_id, exercise_id))
         
         # Reorder remaining queue items
         execute_query('''
             UPDATE user_queue 
             SET queue_position = queue_position - 1 
-            WHERE user_id = ? AND queue_position > 1
+            WHERE user_id = %s AND queue_position > 1
         ''', (user_id,))
     else:
         # Move failed exercise to bottom of queue
         execute_query('''
             UPDATE user_queue 
-            SET queue_position = (SELECT MAX(queue_position) + 1 FROM user_queue WHERE user_id = ?)
-            WHERE user_id = ? AND exercise_id = ?
+            SET queue_position = (SELECT MAX(queue_position) + 1 FROM user_queue WHERE user_id = %s)
+            WHERE user_id = %s AND exercise_id = %s
         ''', (user_id, user_id, exercise_id))
     
     return status
@@ -278,86 +301,8 @@ else:
     print("⚠️  OpenAI API key not found. Question generation will use fallback questions.")
 
 def init_database():
-    """Initialize the database with exercises and user tables"""
-    # Create exercises table
-    exercises_sql = adapt_sql_for_dialect('''
-        CREATE TABLE IF NOT EXISTS exercises (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            text TEXT NOT NULL,
-            language TEXT DEFAULT 'en',
-            difficulty TEXT DEFAULT 'intermediate',
-            topic TEXT DEFAULT 'general',
-            questions TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    execute_query(exercises_sql)
-    
-    # Create users table
-    users_sql = adapt_sql_for_dialect('''
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            email TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            preferred_language TEXT DEFAULT 'en',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            last_login TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    execute_query(users_sql)
-    
-    # Create user_progress table to track reading sessions and comprehension
-    progress_sql = adapt_sql_for_dialect('''
-        CREATE TABLE IF NOT EXISTS user_progress (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            exercise_id INTEGER NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending',
-            comprehension_score REAL DEFAULT 0.0,
-            questions_answered INTEGER DEFAULT 0,
-            questions_correct INTEGER DEFAULT 0,
-            reading_speed_wpm REAL DEFAULT 0.0,
-            session_duration_seconds INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            completed_at TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users (id),
-            FOREIGN KEY (exercise_id) REFERENCES exercises (id),
-            UNIQUE(user_id, exercise_id)
-        )
-    ''')
-    execute_query(progress_sql)
-    
-    # Create user_queue table to manage text queue for each user
-    queue_sql = adapt_sql_for_dialect('''
-        CREATE TABLE IF NOT EXISTS user_queue (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            exercise_id INTEGER NOT NULL,
-            queue_position INTEGER NOT NULL,
-            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users (id),
-            FOREIGN KEY (exercise_id) REFERENCES exercises (id),
-            UNIQUE(user_id, exercise_id)
-        )
-    ''')
-    execute_query(queue_sql)
-    
-    # Create indexes for better performance
-    index_sqls = [
-        'CREATE INDEX IF NOT EXISTS idx_language ON exercises(language)',
-        'CREATE INDEX IF NOT EXISTS idx_difficulty ON exercises(difficulty)',
-        'CREATE INDEX IF NOT EXISTS idx_topic ON exercises(topic)',
-        'CREATE INDEX IF NOT EXISTS idx_user_progress_user_id ON user_progress(user_id)',
-        'CREATE INDEX IF NOT EXISTS idx_user_progress_status ON user_progress(status)',
-        'CREATE INDEX IF NOT EXISTS idx_user_queue_user_id ON user_queue(user_id)',
-        'CREATE INDEX IF NOT EXISTS idx_user_queue_position ON user_queue(queue_position)'
-    ]
-    
-    for index_sql in index_sqls:
-        execute_query(index_sql)
+    """Initialize the PostgreSQL database with all tables and indexes"""
+    init_database_schema()
 
 def insert_sample_exercises():
     """Insert sample exercises into the database"""
@@ -366,7 +311,7 @@ def insert_sample_exercises():
     count = count_result[0]['count'] if count_result else 0
     
     # Always add English exercises if they don't exist
-    en_result = execute_query('SELECT COUNT(*) as count FROM exercises WHERE language = ?', ('en',), fetch=True)
+    en_result = execute_query('SELECT COUNT(*) as count FROM exercises WHERE language = %s', ('en',), fetch=True)
     en_count = en_result[0]['count'] if en_result else 0
     
     if en_count == 0:
@@ -416,7 +361,7 @@ def insert_sample_exercises():
         for exercise in english_exercises:
             execute_query('''
                 INSERT INTO exercises (title, text, language, difficulty, topic, questions)
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s)
             ''', (
                 exercise['title'],
                 exercise['text'],
@@ -775,7 +720,7 @@ def get_user_progress():
         
         # Get queue information
         queue_result = execute_query('''
-            SELECT COUNT(*) as count FROM user_queue WHERE user_id = ?
+            SELECT COUNT(*) as count FROM user_queue WHERE user_id = %s
         ''', (user["user_id"],), fetch=True)
         
         queue_count = queue_result[0]['count'] if queue_result else 0
@@ -861,7 +806,7 @@ def add_exercise():
         
         execute_query('''
             INSERT INTO exercises (title, text, language, difficulty, topic, questions)
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s)
         ''', (
             data['title'],
             data['text'],
@@ -872,7 +817,7 @@ def add_exercise():
         ))
         
         # Get the new exercise ID
-        new_exercise = execute_query('SELECT id FROM exercises WHERE title = ? AND text = ?', 
+        new_exercise = execute_query('SELECT id FROM exercises WHERE title = %s AND text = %s', 
                                    (data['title'], data['text']), fetch=True)
         exercise_id = new_exercise[0]['id'] if new_exercise else None
         
@@ -928,7 +873,7 @@ def register():
             }), 400
         
         # Check if user already exists
-        existing_user = execute_query('SELECT id FROM users WHERE username = ? OR email = ?', (username, email), fetch=True)
+        existing_user = execute_query('SELECT id FROM users WHERE username = %s OR email = %s', (username, email), fetch=True)
         if existing_user:
             return jsonify({
                 "success": False,
@@ -939,11 +884,11 @@ def register():
         password_hash = hash_password(password)
         execute_query('''
             INSERT INTO users (username, email, password_hash, preferred_language)
-            VALUES (?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s)
         ''', (username, email, password_hash, preferred_language))
         
         # Get the new user ID
-        new_user = execute_query('SELECT id FROM users WHERE email = ?', (email,), fetch=True)
+        new_user = execute_query('SELECT id FROM users WHERE email = %s', (email,), fetch=True)
         user_id = new_user[0]['id'] if new_user else None
         
         if user_id:
@@ -997,7 +942,7 @@ def login():
         user_result = execute_query('''
             SELECT id, username, email, password_hash, preferred_language 
             FROM users 
-            WHERE username = ? OR email = ?
+            WHERE username = %s OR email = %s
         ''', (username, username.lower()), fetch=True)
         
         if not user_result:
@@ -1028,7 +973,7 @@ def login():
         }
         
         # Update last login
-        execute_query('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?', (user_id,))
+        execute_query('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = %s', (user_id,))
         
         return jsonify({
             "success": True,
